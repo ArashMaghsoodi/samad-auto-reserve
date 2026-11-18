@@ -84,6 +84,19 @@ class UserRepositoryTests(unittest.TestCase):
         self.assertEqual(profile.weekly_run_time, "07:30")
         self.assertTrue(profile.weekly_enabled)
 
+    def test_can_initialize_user_before_credentials_and_remove_password(self) -> None:
+        self.repository.ensure_user(123, "Default University")
+        profile = self.repository.get_profile(123)
+        self.assertEqual(profile.university, "Default University")
+        self.assertIsNone(self.repository.get_credentials(123))
+
+        self.repository.save_credentials(123, "student-id", "password", "Default University")
+        self.repository.update_schedule(123, "08:00", True)
+        self.repository.remove_credentials(123)
+
+        self.assertIsNone(self.repository.get_credentials(123))
+        self.assertFalse(self.repository.get_profile(123).weekly_enabled)
+
 
 if __name__ == "__main__":
     unittest.main()

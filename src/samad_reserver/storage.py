@@ -105,6 +105,35 @@ class UserRepository:
                 (telegram_user_id, university, username, ciphertext),
             )
 
+    def ensure_user(self, telegram_user_id: int, university: str) -> None:
+        self._validate_user_id(telegram_user_id)
+        university = university.strip()
+        if not university:
+            raise ValueError("university must not be empty")
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO users (telegram_user_id, university)
+                VALUES (?, ?)
+                ON CONFLICT (telegram_user_id) DO NOTHING
+                """,
+                (telegram_user_id, university),
+            )
+
+    def remove_credentials(self, telegram_user_id: int) -> None:
+        self._validate_user_id(telegram_user_id)
+        with self._connect() as connection:
+            result = connection.execute(
+                """
+                UPDATE users
+                SET username = NULL, password_ciphertext = NULL, weekly_enabled = 0
+                WHERE telegram_user_id = ?
+                """,
+                (telegram_user_id,),
+            )
+        if result.rowcount == 0:
+            raise LookupError("user is not configured")
+
     def get_credentials(self, telegram_user_id: int) -> Credentials | None:
         self._validate_user_id(telegram_user_id)
         with self._connect() as connection:
