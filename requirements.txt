@@ -1,0 +1,5 @@
+APScheduler>=3.10,<4
+cryptography>=44,<47
+playwright>=1.50,<2
+pyTelegramBotAPI>=4.28,<5
+python-dotenv>=1.0,<2
