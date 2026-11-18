@@ -16,6 +16,9 @@ dependencies = [
     "python-dotenv>=1.0,<2",
 ]
 
+[project.scripts]
+samad-auto-reserve = "samad_reserver.main:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

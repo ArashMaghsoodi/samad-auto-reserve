@@ -8,7 +8,7 @@ from telebot.apihelper import ApiException
 
 from samad_reserver.config import Settings
 from samad_reserver.domain import Meal, MealPreference, Weekday
-from samad_reserver.errors import ReservationError
+from samad_reserver.errors import InsufficientBalanceError, ReservationError
 from samad_reserver.storage import UserRepository
 
 LOGGER = logging.getLogger(__name__)
@@ -448,17 +448,29 @@ class TelegramBot:
             self.api.send_message(message.chat.id, "Reservation automation is not available.")
             return
         try:
-            credentials = self.repository.get_credentials(self._user_id(message))
-            if credentials is None:
-                self.api.send_message(message.chat.id, "Set your Samad credentials first with /credentials.")
-                return
             if check_balance:
                 result = self.reservation_service.check_balance_for_user(self._user_id(message))
             else:
                 result = self.reservation_service.run_for_user(self._user_id(message))
-        except (ReservationError, sqlite3.Error):
+        except InsufficientBalanceError as error:
+            LOGGER.warning(
+                "Insufficient Samad balance for Telegram user %s",
+                self._user_id(message),
+            )
+            self.api.send_message(
+                message.chat.id,
+                "اعتبار شما کم است، لطفاً شارژ کنید. "
+                f"هزینه لازم: {error.required_toman:,} تومان؛ "
+                f"اعتبار فعلی: {error.balance_toman:,} تومان.",
+            )
+            return
+        except ReservationError as error:
             LOGGER.exception("Samad operation failed for Telegram user %s", self._user_id(message))
-            self.api.send_message(message.chat.id, "Samad operation failed. See the run details and try again.")
+            self.api.send_message(message.chat.id, str(error))
+            return
+        except sqlite3.Error:
+            LOGGER.exception("Samad operation storage failed for Telegram user %s", self._user_id(message))
+            self.api.send_message(message.chat.id, "Could not read or update local data. Please try again.")
             return
         self.api.send_message(message.chat.id, result)
 
