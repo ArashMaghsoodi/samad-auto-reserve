@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "samad-auto-reserve"
+version = "0.1.0"
+description = "Telegram-configured food reservations for the Samad university portal"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "APScheduler>=3.10,<4",
+    "cryptography>=44,<47",
+    "playwright>=1.50,<2",
+    "pyTelegramBotAPI>=4.28,<5",
+    "python-dotenv>=1.0,<2",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+samad_reserver = ["py.typed"]
