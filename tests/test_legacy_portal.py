@@ -127,6 +127,7 @@ class LegacyPortalLoginTests(unittest.TestCase):
         )
         self.automation._visible_count = Mock(return_value=1)
         self.automation._click_unique = Mock()
+        self.automation._handle_send_anyway_prompt = Mock()
         self.automation._wait_for_legacy_dashboard = Mock()
 
         self.automation._login(
@@ -135,7 +136,51 @@ class LegacyPortalLoginTests(unittest.TestCase):
         )
 
         page.evaluate.assert_not_called()
+        self.automation._handle_send_anyway_prompt.assert_called_once_with(page)
         self.automation._wait_for_legacy_dashboard.assert_called_once_with(page)
+
+    def test_clicks_send_anyway_confirmation_on_secure_portal(self) -> None:
+        page = Mock(url="https://food.sru.ac.ir/index.rose")
+        button = Mock()
+        page.get_by_role.return_value = button
+        self.automation._visible_count = Mock(return_value=1)
+        self.automation._click_unique = Mock()
+
+        self.automation._handle_send_anyway_prompt(page)
+
+        page.get_by_role.assert_called_once_with(
+            "button",
+            name="Send anyway",
+            exact=True,
+        )
+        button.wait_for.assert_called_once_with(
+            state="visible",
+            timeout=self.automation.legacy_prompt_timeout_ms,
+        )
+        self.automation._click_unique.assert_called_once_with(
+            button,
+            "Send anyway confirmation button",
+        )
+
+    def test_does_not_click_send_anyway_confirmation_on_nonsecure_origin(self) -> None:
+        page = Mock(url="http://food.sru.ac.ir/index.rose")
+        self.automation._click_unique = Mock()
+
+        self.automation._handle_send_anyway_prompt(page)
+
+        page.get_by_role.assert_not_called()
+        self.automation._click_unique.assert_not_called()
+
+    def test_continues_when_send_anyway_confirmation_is_absent(self) -> None:
+        page = Mock(url="https://food.sru.ac.ir/index.rose")
+        button = Mock()
+        button.wait_for.side_effect = PlaywrightTimeoutError("not present")
+        page.get_by_role.return_value = button
+        self.automation._click_unique = Mock()
+
+        self.automation._handle_send_anyway_prompt(page)
+
+        self.automation._click_unique.assert_not_called()
 
     def test_waits_for_the_dashboard_after_cross_document_login_navigation(self) -> None:
         with self.automation._open_page() as page:

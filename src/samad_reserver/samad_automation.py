@@ -274,12 +274,33 @@ class SamadAutomation:
                     ) from error
             LOGGER.debug("Submitting the login form")
             self._click_unique(login_button, "legacy portal login button")
+            self._handle_send_anyway_prompt(page)
         except PlaywrightError as error:
             raise ReservationError("Could not complete the legacy portal login form") from error
 
         LOGGER.debug("Login form submitted; waiting for the student dashboard")
         self._wait_for_legacy_dashboard(page)
         LOGGER.debug("Student dashboard detected")
+
+    def _handle_send_anyway_prompt(self, page: Page) -> None:
+        page_url = urlsplit(page.url)
+        if page_url.scheme != "https" or page_url.hostname != LEGACY_PORTAL_HOST:
+            return
+
+        send_anyway_button = page.get_by_role(
+            "button",
+            name="Send anyway",
+            exact=True,
+        )
+        try:
+            send_anyway_button.wait_for(
+                state="visible",
+                timeout=self.legacy_prompt_timeout_ms,
+            )
+        except PlaywrightTimeoutError:
+            return
+
+        self._click_unique(send_anyway_button, "Send anyway confirmation button")
 
     @staticmethod
     def _raise_if_blocked_form_submission(page: Page) -> None:
