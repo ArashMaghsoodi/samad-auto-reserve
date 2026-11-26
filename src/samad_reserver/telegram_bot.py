@@ -1,10 +1,13 @@
+import hmac
 import logging
+import re
 import sqlite3
 import threading
 from typing import Callable, Protocol
 
 import telebot
 from telebot.apihelper import ApiException
+from telebot.types import BotCommand, Message
 
 from samad_reserver.config import Settings
 from samad_reserver.domain import Meal, MealPreference, Weekday
@@ -31,6 +34,9 @@ _WEEKDAY_ALIASES = {
     "thurs": Weekday.THURSDAY,
     "friday": Weekday.FRIDAY,
     "fri": Weekday.FRIDAY,
+    "سه شنبه": Weekday.TUESDAY,
+    "چهار شنبه": Weekday.WEDNESDAY,
+    "پنج شنبه": Weekday.THURSDAY,
 }
 
 _MEAL_ALIASES = {
@@ -44,7 +50,32 @@ _MEAL_ALIASES = {
 
 
 def _normalize(value: str) -> str:
-    return value.strip().casefold().replace("ي", "ی").replace("ك", "ک")
+    normalized = value.strip().casefold().replace("ي", "ی").replace("ك", "ک")
+    return " ".join(normalized.replace("\u200c", " ").split())
+
+
+def _parse_weekday_prefix(tokens: list[str]) -> tuple[Weekday, int]:
+    normalized_tokens = [_normalize(token) for token in tokens]
+    candidates = {
+        tuple(_normalize(weekday.persian_label).split()): weekday
+        for weekday in Weekday
+    }
+    candidates.update(
+        {
+            tuple(_normalize(alias).split()): weekday
+            for alias, weekday in _WEEKDAY_ALIASES.items()
+        }
+    )
+    candidates.update({(str(index),): Weekday(index) for index in range(7)})
+
+    for candidate, weekday in sorted(
+        candidates.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        if tuple(normalized_tokens[: len(candidate)]) == candidate:
+            return weekday, len(candidate)
+    raise ValueError("weekday must be Saturday-Friday or a number from 0 to 6")
 
 
 def parse_weekday(value: str) -> Weekday:
@@ -71,19 +102,40 @@ def parse_meal(value: str) -> Meal:
 
 
 def parse_meal_preference_command(command: str) -> MealPreference:
-    parts = command.strip().split(maxsplit=3)
-    if len(parts) != 4 or parts[0].split("@", maxsplit=1)[0] != "/setmeal":
+    command_parts = command.strip().split(maxsplit=1)
+    if (
+        len(command_parts) != 2
+        or command_parts[0].split("@", maxsplit=1)[0] != "/setmeal"
+    ):
         raise ValueError("usage: /setmeal <weekday> <meal> <exact dining hall name>")
-    weekday = parse_weekday(parts[1])
-    meal = parse_meal(parts[2])
-    return MealPreference(weekday=weekday, meal=meal, dining_hall=parts[3])
+    arguments = command_parts[1]
+    token_matches = list(re.finditer(r"\S+", arguments))
+    tokens = [match.group() for match in token_matches]
+    weekday, weekday_token_count = _parse_weekday_prefix(tokens)
+    meal_token_index = weekday_token_count
+    if len(tokens) <= meal_token_index + 1:
+        raise ValueError("usage: /setmeal <weekday> <meal> <exact dining hall name>")
+    meal = parse_meal(tokens[meal_token_index])
+    dining_hall = arguments[token_matches[meal_token_index + 1].start() :].strip()
+    return MealPreference(
+        weekday=int(weekday),
+        meal=meal,
+        dining_hall=dining_hall,
+    )
 
 
 def parse_clear_meal_command(command: str) -> tuple[int, Meal]:
-    parts = command.strip().split()
-    if len(parts) != 3 or parts[0].split("@", maxsplit=1)[0] != "/clearmeal":
+    command_parts = command.strip().split(maxsplit=1)
+    if (
+        len(command_parts) != 2
+        or command_parts[0].split("@", maxsplit=1)[0] != "/clearmeal"
+    ):
         raise ValueError("usage: /clearmeal <weekday> <meal>")
-    return int(parse_weekday(parts[1])), parse_meal(parts[2])
+    tokens = command_parts[1].split()
+    weekday, weekday_token_count = _parse_weekday_prefix(tokens)
+    if len(tokens) != weekday_token_count + 1:
+        raise ValueError("usage: /clearmeal <weekday> <meal>")
+    return int(weekday), parse_meal(tokens[weekday_token_count])
 
 
 class ReservationService(Protocol):
@@ -108,12 +160,17 @@ class TelegramBot:
         self.api = api or telebot.TeleBot(settings.telegram_bot_token)
         self._states: dict[int, str] = {}
         self._usernames: dict[int, str] = {}
+        self._verbose_pin_failures: dict[int, int] = {}
+        self._verbose_pin_locked_users: set[int] = set()
         self._state_lock = threading.Lock()
+        self._verbose_enabled = False
+        self._previous_package_log_level: int | None = None
         self._register_handlers()
 
     def _register_handlers(self) -> None:
         self.api.message_handler(commands=["start"])(self._handle_start)
         self.api.message_handler(commands=["help"])(self._handle_help)
+        self.api.message_handler(commands=["verbose"])(self._handle_verbose)
         self.api.message_handler(commands=["credentials"])(self._handle_credentials)
         self.api.message_handler(commands=["cancel"])(self._handle_cancel)
         self.api.message_handler(commands=["university"])(self._handle_university)
@@ -173,7 +230,7 @@ class TelegramBot:
         self.api.send_message(
             message.chat.id,
             "Welcome to Samad Auto Reserve.\n"
-            "Configure your account with /credentials and /university, then use "
+            "Configure your account with /credentials, then use "
             "/setmeal <weekday> <meal> <exact dining hall name>.\n"
             "Use /help to see all commands.",
         )
@@ -185,7 +242,7 @@ class TelegramBot:
             message.chat.id,
             "Commands:\n"
             "/credentials - securely replace your Samad username and password\n"
-            "/university <name> - set your university\n"
+            "/verbose - enable or disable detailed diagnostics with the configured PIN\n"
             "/setmeal <weekday> <meal> <dining hall> - set one exact place for a meal\n"
             "/clearmeal <weekday> <meal> - remove one preference\n"
             "/preferences - review your weekly meal settings\n"
@@ -196,7 +253,8 @@ class TelegramBot:
             "/forget - remove saved credentials and disable scheduling\n"
             "/cancel - cancel an active setup prompt\n\n"
             "Weekdays accept Saturday-Friday or Persian weekday names; meals accept "
-            "breakfast/lunch/dinner or صبحانه/ناهار/شام.",
+            "breakfast/lunch/dinner or صبحانه/ناهار/شام. Persian weekday names may "
+            "contain a space, e.g. /setmeal سه شنبه ناهار سلف مرکزی برادران.",
         )
 
     def _handle_credentials(self, message: telebot.types.Message) -> None:
@@ -238,11 +296,17 @@ class TelegramBot:
         if state is None:
             return
         if not self._require_private(message):
-            if state == "password":
-                self._delete_password_message(message)
+            if state in {"password", "verbose_pin"}:
+                self._delete_sensitive_message(
+                    message,
+                    "password" if state == "password" else "verbose PIN",
+                )
             return
 
         text = message.text or ""
+        if state == "verbose_pin":
+            self._handle_verbose_pin(message, text)
+            return
         if text.startswith("/"):
             self.api.send_message(
                 message.chat.id,
@@ -261,6 +325,110 @@ class TelegramBot:
             return
         if state == "password":
             self._save_password(message, text)
+
+    def _handle_verbose(self, message: Message) -> None:
+        if not self._require_private(message):
+            return
+        user_id = self._user_id(message)
+        if self.settings.verbose_pin is None:
+            self.api.send_message(
+                message.chat.id,
+                "Verbose diagnostics are not configured. Set VERBOSE_PIN to four digits in .env.",
+            )
+            return
+        with self._state_lock:
+            is_locked = user_id in self._verbose_pin_locked_users
+            if not is_locked:
+                self._states[user_id] = "verbose_pin"
+        if is_locked:
+            self.api.send_message(
+                message.chat.id,
+                "Verbose PIN attempts are locked until the bot restarts.",
+            )
+            return
+        self.api.send_message(
+            message.chat.id,
+            "Enter the 4-digit diagnostics PIN. Use /cancel to cancel.",
+        )
+
+    def _handle_verbose_pin(
+        self,
+        message: Message,
+        entered_pin: str,
+    ) -> None:
+        user_id = self._user_id(message)
+        self._delete_sensitive_message(message, "verbose PIN")
+        if not re.fullmatch(r"[0-9]{4}", entered_pin):
+            matches = False
+        else:
+            matches = hmac.compare_digest(
+                entered_pin,
+                self.settings.verbose_pin or "",
+            )
+
+        locked_out = False
+        with self._state_lock:
+            if user_id in self._verbose_pin_locked_users:
+                self._states.pop(user_id, None)
+                locked_out = True
+            if matches:
+                self._states.pop(user_id, None)
+                self._verbose_pin_failures.pop(user_id, None)
+            elif not locked_out:
+                failures = self._verbose_pin_failures.get(user_id, 0) + 1
+                self._verbose_pin_failures[user_id] = failures
+                if failures >= 5:
+                    self._states.pop(user_id, None)
+                    self._verbose_pin_locked_users.add(user_id)
+                    locked_out = True
+
+        if locked_out and matches:
+            self.api.send_message(
+                message.chat.id,
+                "Verbose PIN attempts are locked until the bot restarts.",
+            )
+            return
+
+        if not matches:
+            if locked_out:
+                self.api.send_message(
+                    message.chat.id,
+                    "Too many incorrect PIN attempts. Diagnostics are locked until the bot restarts.",
+                )
+            else:
+                self.api.send_message(
+                    message.chat.id,
+                    "Incorrect PIN. Try again or use /cancel.",
+                )
+            return
+
+        self._set_verbose_logging(not self._verbose_enabled)
+        state = "enabled" if self._verbose_enabled else "disabled"
+        LOGGER.info(
+            "Verbose diagnostics %s by Telegram user %s",
+            state,
+            user_id,
+        )
+        self.api.send_message(
+            message.chat.id,
+            "Verbose diagnostics "
+            + state
+            + ". Sensitive values and URL query strings are not logged.",
+        )
+
+    def _set_verbose_logging(self, enabled: bool) -> None:
+        package_logger = logging.getLogger("samad_reserver")
+        if enabled:
+            if self._previous_package_log_level is None:
+                self._previous_package_log_level = package_logger.level
+            package_logger.setLevel(logging.DEBUG)
+            self._verbose_enabled = True
+            return
+
+        if self._previous_package_log_level is not None:
+            package_logger.setLevel(self._previous_package_log_level)
+            self._previous_package_log_level = None
+        self._verbose_enabled = False
 
     def _save_password(self, message: telebot.types.Message, password: str) -> None:
         user_id = self._user_id(message)
@@ -292,12 +460,20 @@ class TelegramBot:
                 "Please delete it manually from this chat.",
             )
 
-    def _delete_password_message(self, message: telebot.types.Message) -> bool:
+    def _delete_password_message(self, message: Message) -> bool:
+        return self._delete_sensitive_message(message, "password")
+
+    def _delete_sensitive_message(
+        self,
+        message: Message,
+        description: str,
+    ) -> bool:
         try:
             return bool(self.api.delete_message(message.chat.id, message.message_id))
         except ApiException:
             LOGGER.warning(
-                "Could not delete password message for Telegram user %s",
+                "Could not delete %s message for Telegram user %s",
+                description,
                 self._user_id(message),
             )
             return False
@@ -305,19 +481,10 @@ class TelegramBot:
     def _handle_university(self, message: telebot.types.Message) -> None:
         if not self._require_private(message):
             return
-        university = self._command_arguments(message)
-        if not university:
-            self.api.send_message(message.chat.id, "Usage: /university <university name>")
-            return
-        user_id = self._user_id(message)
-        try:
-            self._ensure_user(user_id)
-            self.repository.update_university(user_id, university)
-        except (ValueError, sqlite3.Error):
-            LOGGER.exception("Could not update university for Telegram user %s", user_id)
-            self.api.send_message(message.chat.id, "Could not update your university.")
-            return
-        self.api.send_message(message.chat.id, f"University set to: {university}")
+        self.api.send_message(
+            message.chat.id,
+            "University selection is fixed: the legacy portal is for Shahid Rajaee University.",
+        )
 
     def _handle_set_meal(self, message: telebot.types.Message) -> None:
         if not self._require_private(message):
@@ -475,6 +642,23 @@ class TelegramBot:
         self.api.send_message(message.chat.id, result)
 
     def start_polling(self) -> None:
+        self.api.set_my_commands(
+            [
+                BotCommand("start", "Start setup"),
+                BotCommand("help", "Show help"),
+                BotCommand("credentials", "Set Samad credentials"),
+                BotCommand("verbose", "Toggle PIN-protected diagnostics"),
+                BotCommand("university", "Show the configured university"),
+                BotCommand("setmeal", "Set a meal preference"),
+                BotCommand("clearmeal", "Remove a meal preference"),
+                BotCommand("preferences", "Show meal preferences"),
+                BotCommand("schedule", "Set weekly reservation time"),
+                BotCommand("balance", "Check wallet balance"),
+                BotCommand("run", "Run reservations now"),
+                BotCommand("forget", "Remove saved credentials"),
+                BotCommand("cancel", "Cancel current prompt"),
+            ]
+        )
         self.api.infinity_polling(skip_pending=True)
 
     def stop_polling(self) -> None:

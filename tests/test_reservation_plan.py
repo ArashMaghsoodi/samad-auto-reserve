@@ -73,6 +73,10 @@ class ReservationPlanTests(unittest.TestCase):
         self.assertEqual(parse_wallet_balance("اعتبار شما\n۲۴۰٬۰۰۰\nتومان"), 240_000)
         self.assertEqual(parse_toman_amount("۳۰,۰۰۰ تومان"), 30_000)
 
+    def test_converts_legacy_portal_rial_amounts_to_toman(self) -> None:
+        self.assertEqual(parse_wallet_balance("موجودی حساب: ۳۰۰٬۰۰۰ ریال"), 30_000)
+        self.assertEqual(parse_toman_amount("ناهار ۸۰,۰۰۰ ریال"), 8_000)
+
     def test_rejects_missing_or_ambiguous_currency_amounts(self) -> None:
         with self.assertRaises(ReservationError):
             parse_wallet_balance("اعتبار نامشخص")

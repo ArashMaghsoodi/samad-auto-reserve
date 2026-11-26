@@ -33,13 +33,13 @@ class FakeAutomation:
         self.reservation_started = threading.Event()
         self.release_reservation = threading.Event()
 
-    def reserve_week(self, credentials, university, preferences):
+    def reserve_week(self, credentials, preferences):
         self.reservation_started.set()
         if self.block_reservations:
             self.release_reservation.wait(timeout=5)
         return self.report
 
-    def check_balance(self, credentials, university):
+    def check_balance(self, credentials):
         return self.balance
 
 
@@ -75,11 +75,22 @@ class ReservationServiceTests(unittest.TestCase):
         self.assertEqual(saved_run[0], "completed")
         self.assertEqual(saved_run[1], summary)
 
+    def test_verbose_logs_service_progress_without_credential_values(self) -> None:
+        with self.assertLogs("samad_reserver.service", level="DEBUG") as logs:
+            self.service.run_for_user(123)
+
+        output = "\n".join(logs.output)
+        self.assertIn("Starting reservation service run", output)
+        self.assertIn("Loaded 1 meal preferences", output)
+        self.assertIn("status=completed", output)
+        self.assertNotIn("password", output)
+        self.assertNotIn("student-id", output)
+
     def test_low_balance_is_recorded_and_reported_as_a_specific_error(self) -> None:
         self.automation.report = None
 
         class InsufficientAutomation(FakeAutomation):
-            def reserve_week(self, credentials, university, preferences):
+            def reserve_week(self, credentials, preferences):
                 raise InsufficientBalanceError(60_000, 50_000)
 
         service = ReservationService(self.repository, InsufficientAutomation())

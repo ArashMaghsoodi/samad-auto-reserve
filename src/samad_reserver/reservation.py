@@ -9,7 +9,9 @@ _DIGIT_TRANSLATION = str.maketrans(
     "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
     "01234567890123456789",
 )
-_AMOUNT_PATTERN = re.compile(r"(?<!\d)([\d۰-۹٠-٩][\d۰-۹٠-٩,٬،]*)\s*(?:تومان|تومن)")
+_AMOUNT_PATTERN = re.compile(
+    r"(?<!\d)([\d][\d,٬،]*)\s*(ریال|تومان|تومن)"
+)
 
 
 @dataclass(frozen=True)
@@ -101,20 +103,26 @@ class ReservationReport:
 def parse_toman_amount(text: str) -> int:
     amounts = _AMOUNT_PATTERN.findall(text.translate(_DIGIT_TRANSLATION))
     if len(amounts) != 1:
-        raise ReservationError("Could not read one unambiguous toman amount from Samad")
+        raise ReservationError("Could not read one unambiguous meal price from the portal")
     try:
-        return int(re.sub(r"[,٬،]", "", amounts[0]))
+        value = int(re.sub(r"[,٬،]", "", amounts[0][0]))
     except ValueError as error:
-        raise ReservationError("Samad displayed an invalid toman amount") from error
+        raise ReservationError("The portal displayed an invalid meal price") from error
+    if amounts[0][1] == "ریال":
+        if value % 10:
+            raise ReservationError("The portal displayed a rial amount that cannot be converted exactly")
+        return value // 10
+    return value
 
 
 def parse_wallet_balance(page_text: str) -> int:
     wallet_match = re.search(
-        r"اعتبار(?:\s*شما)?[\s\S]{0,80}?([\d۰-۹٠-٩][\d۰-۹٠-٩,٬،]*)\s*(?:تومان|تومن)",
-        page_text,
+        r"(?:اعتبار|موجودی)\D{0,40}"
+        r"([\d][\d,٬،]*\s*(?:ریال|تومان|تومن))",
+        page_text.translate(_DIGIT_TRANSLATION),
     )
     if wallet_match is None:
-        raise ReservationError("Could not verify the Samad wallet balance")
+        raise ReservationError("Could not verify the portal wallet balance")
     return parse_toman_amount(wallet_match.group(0))
 
 

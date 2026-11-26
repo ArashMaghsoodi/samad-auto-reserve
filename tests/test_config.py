@@ -15,7 +15,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.telegram_bot_token, "bot-token")
         self.assertEqual(settings.credential_encryption_key, "encryption-key")
         self.assertEqual(settings.database_path, "data/reservations.sqlite3")
-        self.assertEqual(settings.samad_base_url, "https://samad.app")
+        self.assertEqual(settings.samad_base_url, "https://food.sru.ac.ir")
         self.assertEqual(settings.default_university, "دانشگاه شهید رجایی")
         self.assertTrue(settings.browser_headless)
 
@@ -48,7 +48,30 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.default_university, "University")
         self.assertFalse(settings.browser_headless)
 
-    def test_rejects_empty_database_path_and_non_http_samad_url(self) -> None:
+    def test_accepts_a_four_digit_verbose_pin(self) -> None:
+        settings = Settings.from_env(
+            {
+                "TELEGRAM_BOT_TOKEN": "bot-token",
+                "CREDENTIAL_ENCRYPTION_KEY": "encryption-key",
+                "VERBOSE_PIN": "0427",
+            }
+        )
+
+        self.assertEqual(settings.verbose_pin, "0427")
+
+    def test_rejects_a_verbose_pin_that_is_not_four_ascii_digits(self) -> None:
+        for invalid_pin in ("123", "12345", "12a4", "۱۲۳۴"):
+            with self.subTest(invalid_pin=invalid_pin):
+                with self.assertRaisesRegex(ValueError, "VERBOSE_PIN"):
+                    Settings.from_env(
+                        {
+                            "TELEGRAM_BOT_TOKEN": "bot-token",
+                            "CREDENTIAL_ENCRYPTION_KEY": "encryption-key",
+                            "VERBOSE_PIN": invalid_pin,
+                        }
+                    )
+
+    def test_rejects_empty_database_path_and_non_https_samad_url(self) -> None:
         base = {
             "TELEGRAM_BOT_TOKEN": "bot-token",
             "CREDENTIAL_ENCRYPTION_KEY": "encryption-key",
@@ -58,6 +81,10 @@ class SettingsTests(unittest.TestCase):
             Settings.from_env({**base, "DATABASE_PATH": " "})
         with self.assertRaisesRegex(ValueError, "SAMAD_BASE_URL"):
             Settings.from_env({**base, "SAMAD_BASE_URL": "samad.app"})
+        with self.assertRaisesRegex(ValueError, "HTTPS"):
+            Settings.from_env({**base, "SAMAD_BASE_URL": "http://food.sru.ac.ir"})
+        with self.assertRaisesRegex(ValueError, "food.sru.ac.ir"):
+            Settings.from_env({**base, "SAMAD_BASE_URL": "https://samad.app"})
 
 
 if __name__ == "__main__":
