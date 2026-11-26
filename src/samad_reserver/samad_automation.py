@@ -36,6 +36,7 @@ from samad_reserver.reservation import (
 
 _RESERVED_MARKERS = ("لغو رزرو", "رزرو شده", "رزرو ثبت شده")
 _CONFIRM_LABELS = ("تأیید", "تایید", "بله", "رزرو")
+_CREDIT_PAGE_PATH = "/nurture/user/credit/charge/view.rose"
 LOGGER = logging.getLogger(__name__)
 _PLAYWRIGHT_DRIVER_START_LOCK = Lock()
 _SECURE_FORM_SUBMISSION_GUARD = """
@@ -141,7 +142,7 @@ class SamadAutomation:
         LOGGER.debug("Starting a Samad wallet balance check")
         with self._open_page() as page:
             self._login(page, credentials)
-            return parse_wallet_balance(page.locator("body").inner_text())
+            return self._read_wallet_balance(page)
 
     def reserve_week(
         self,
@@ -162,8 +163,9 @@ class SamadAutomation:
         halls = sorted({item.dining_hall for item in selected_preferences})
         with self._open_page() as page:
             self._login(page, credentials)
+            balance_toman = self._read_wallet_balance(page)
+            self._return_to_dashboard(page)
             self._open_reservation_page(page, selected_preferences[0].dining_hall, halls)
-            balance_toman = parse_wallet_balance(page.locator("body").inner_text())
 
             availability = []
             for preference in selected_preferences:
@@ -673,7 +675,9 @@ class SamadAutomation:
             "(and any insecure-form interstitial)",
             self._safe_url_for_log(page.url),
         )
+        self._wait_for_dashboard(page)
 
+    def _wait_for_dashboard(self, page: Page) -> None:
         # Poll: dismiss interstitial if it appears, otherwise wait for dashboard text.
         deadline_ts = time.monotonic() + (self.timeout_ms / 1000.0)
         while time.monotonic() < deadline_ts:
@@ -707,7 +711,13 @@ class SamadAutomation:
         )
 
     def _food_reservation_card(self, page: Page) -> Locator:
-        text_matches = page.get_by_text("رزرو غذا", exact=True)
+        return self._dashboard_card(page, "رزرو غذا", "food reservation card")
+
+    def _credit_page_card(self, page: Page) -> Locator:
+        return self._dashboard_card(page, "افزایش اعتبار", "credit card")
+
+    def _dashboard_card(self, page: Page, label: str, description: str) -> Locator:
+        text_matches = page.get_by_text(label, exact=True)
         cards = []
         for index in range(text_matches.count()):
             candidate = text_matches.nth(index)
@@ -717,9 +727,36 @@ class SamadAutomation:
                 cards.append(candidate)
         if len(cards) != 1:
             raise ReservationError(
-                f"Expected one visible food reservation card, found {len(cards)}"
+                f"Expected one visible {description}, found {len(cards)}"
             )
         return cards[0]
+
+    def _open_credit_page(self, page: Page) -> None:
+        self._click_unique(self._credit_page_card(page), "credit card")
+        try:
+            page.wait_for_url(
+                f"**{_CREDIT_PAGE_PATH}**",
+                wait_until="domcontentloaded",
+                timeout=self.timeout_ms,
+            )
+        except PlaywrightTimeoutError as error:
+            raise ReservationError("The portal credit page did not load") from error
+
+    def _read_wallet_balance(self, page: Page) -> int:
+        self._open_credit_page(page)
+        return parse_wallet_balance(page.locator("body").inner_text())
+
+    def _return_to_dashboard(self, page: Page) -> None:
+        try:
+            page.go_back(
+                wait_until="domcontentloaded",
+                timeout=self.timeout_ms,
+            )
+            self._wait_for_dashboard(page)
+        except PlaywrightError as error:
+            raise ReservationError(
+                "Could not return to the dashboard from the wallet page"
+            ) from error
 
     def _open_reservation_page(
         self,

@@ -1,5 +1,6 @@
 import os
 import unittest
+from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
 from playwright.sync_api import Error as PlaywrightError
@@ -182,6 +183,60 @@ class LegacyPortalLoginTests(unittest.TestCase):
             self.automation._wait_for_legacy_dashboard(page)
 
             self.assertTrue(page.url.endswith("/dashboard-test"))
+
+    def test_check_balance_opens_the_credit_page_and_converts_rials(self) -> None:
+        page = Mock()
+        body = Mock()
+        body.inner_text.return_value = "صفحه اصلی رزرو غذا"
+        page.locator.return_value = body
+        credit_card = Mock()
+        credit_card.is_visible.return_value = True
+        credit_card.evaluate.return_value = False
+        credit_card.count.return_value = 1
+        credit_card.nth.return_value = credit_card
+        credit_card.click.side_effect = lambda: setattr(
+            body,
+            "inner_text",
+            Mock(return_value="اعتبار شما ۲۲۰۰۰۰۰ ریال"),
+        )
+        matches = Mock()
+        matches.count.return_value = 1
+        matches.nth.return_value = credit_card
+        page.get_by_text.return_value = matches
+        self.automation._login = Mock()
+
+        with patch.object(self.automation, "_open_page", return_value=nullcontext(page)):
+            balance_toman = self.automation.check_balance(Mock())
+
+        self.assertEqual(balance_toman, 220_000)
+        page.get_by_text.assert_called_once_with("افزایش اعتبار", exact=True)
+        credit_card.click.assert_called_once()
+        page.wait_for_url.assert_called_once_with(
+            "**/nurture/user/credit/charge/view.rose**",
+            wait_until="domcontentloaded",
+            timeout=self.automation.timeout_ms,
+        )
+
+    def test_reservations_return_to_the_dashboard_after_reading_balance(self) -> None:
+        page = Mock()
+        preference = MealPreference(0, Meal.LUNCH, "Central Brothers")
+        self.automation._login = Mock()
+        self.automation._read_wallet_balance = Mock(return_value=220_000)
+        self.automation._return_to_dashboard = Mock()
+        self.automation._open_reservation_page = Mock()
+        self.automation._inspect_preference = Mock(return_value=None)
+
+        with patch.object(self.automation, "_open_page", return_value=nullcontext(page)):
+            report = self.automation.reserve_week(Mock(), [preference])
+
+        self.assertEqual(report.balance_toman, 220_000)
+        self.automation._read_wallet_balance.assert_called_once_with(page)
+        self.automation._return_to_dashboard.assert_called_once_with(page)
+        self.automation._open_reservation_page.assert_called_once_with(
+            page,
+            "Central Brothers",
+            ["Central Brothers"],
+        )
 
     def test_refuses_to_submit_credentials_through_an_http_login_form(self) -> None:
         form = Mock()
