@@ -2,6 +2,7 @@ from contextlib import contextmanager
 import json
 import logging
 import os
+import time
 from threading import Lock
 from typing import Iterator
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -300,7 +301,21 @@ class SamadAutomation:
                         "form manually. Automated verification will not be attempted"
                     ) from error
             LOGGER.debug("Submitting the login form")
+            page.evaluate(
+                """() => {
+                    const form = document.querySelector('form');
+                    if (!form) return;
+                    try {
+                        const action = new URL(form.action || window.location.href, window.location.href);
+                        if (action.protocol === 'http:') {
+                            action.protocol = 'https:';
+                            form.action = action.href;
+                        }
+                    } catch (e) {}
+                }"""
+            )
             self._click_unique(login_button, "legacy portal login button")
+            self._dismiss_insecure_form_warning(page)
         except PlaywrightError as error:
             raise ReservationError("Could not complete the legacy portal login form") from error
 
@@ -576,6 +591,33 @@ class SamadAutomation:
             )
         )
 
+    def _dismiss_insecure_form_warning(self, page: Page) -> bool:
+        """Click Chrome insecure-form interstitial via #proceed-button. Returns True if clicked."""
+        # Chromium: <button id="proceed-button">Send anyway</button>
+        proceed = page.locator("#proceed-button")
+        try:
+            if not proceed.is_visible(timeout=500):
+                return False
+        except PlaywrightError:
+            return False
+
+        LOGGER.debug("Insecure form interstitial detected (#proceed-button); proceeding")
+        try:
+            # Prefer real click; fall back to JS click (interstitial JS listens for click)
+            proceed.click(timeout=2_000, force=True)
+        except PlaywrightError:
+            page.evaluate(
+                """() => {
+                    const btn = document.getElementById('proceed-button');
+                    if (btn) btn.click();
+                }"""
+            )
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=5_000)
+        except PlaywrightTimeoutError:
+            pass
+        return True
+
     def _select_legacy_interface(self, page: Page) -> None:
         old_version_button = page.get_by_role(
             "button",
@@ -627,19 +669,36 @@ class SamadAutomation:
         self._raise_if_blocked_form_submission(page)
 
         LOGGER.debug(
-            "Login navigation finished at %s; checking for the reservation dashboard",
+            "Login navigation finished at %s; checking for the reservation dashboard "
+            "(and any insecure-form interstitial)",
             self._safe_url_for_log(page.url),
         )
-        try:
-            page.wait_for_function(
-                "() => Array.from(document.querySelectorAll('body *')).some(element => "
-                "element.textContent.trim() === 'رزرو غذا' && "
-                "!element.closest('.app-collapsible-item') && "
-                "element.getClientRects().length > 0)",
-                timeout=self.timeout_ms,
-            )
-        except PlaywrightTimeoutError as error:
-            raise ReservationError("The legacy portal student dashboard did not load") from error
+
+        # Poll: dismiss interstitial if it appears, otherwise wait for dashboard text.
+        deadline_ts = time.monotonic() + (self.timeout_ms / 1000.0)
+        while time.monotonic() < deadline_ts:
+            if self._dismiss_insecure_form_warning(page):
+                # After proceeding, give the real page a moment
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=3_000)
+                except PlaywrightTimeoutError:
+                    pass
+                continue
+            # Check if dashboard is already visible
+            try:
+                found = page.evaluate(
+                    "() => Array.from(document.querySelectorAll('body *')).some(element => "
+                    "element.textContent.trim() === 'رزرو غذا' && "
+                    "!element.closest('.app-collapsible-item') && "
+                    "element.getClientRects().length > 0)"
+                )
+                if found:
+                    return
+            except PlaywrightError:
+                pass
+            page.wait_for_timeout(300)
+
+        raise ReservationError("The legacy portal student dashboard did not load")
 
     def _open_food_menu(self, page: Page) -> None:
         self._click_unique(
