@@ -2,7 +2,7 @@ from contextlib import contextmanager
 import json
 import logging
 from typing import Iterator
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from playwright.sync_api import (
     ConsoleMessage,
@@ -274,33 +274,12 @@ class SamadAutomation:
                     ) from error
             LOGGER.debug("Submitting the login form")
             self._click_unique(login_button, "legacy portal login button")
-            self._handle_send_anyway_prompt(page)
         except PlaywrightError as error:
             raise ReservationError("Could not complete the legacy portal login form") from error
 
         LOGGER.debug("Login form submitted; waiting for the student dashboard")
         self._wait_for_legacy_dashboard(page)
         LOGGER.debug("Student dashboard detected")
-
-    def _handle_send_anyway_prompt(self, page: Page) -> None:
-        page_url = urlsplit(page.url)
-        if page_url.scheme != "https" or page_url.hostname != LEGACY_PORTAL_HOST:
-            return
-
-        send_anyway_button = page.get_by_role(
-            "button",
-            name="Send anyway",
-            exact=True,
-        )
-        try:
-            send_anyway_button.wait_for(
-                state="visible",
-                timeout=self.legacy_prompt_timeout_ms,
-            )
-        except PlaywrightTimeoutError:
-            return
-
-        self._click_unique(send_anyway_button, "Send anyway confirmation button")
 
     @staticmethod
     def _raise_if_blocked_form_submission(page: Page) -> None:
@@ -381,6 +360,64 @@ class SamadAutomation:
         route.fulfill(status=307, headers={"Location": secure_url})
 
     @staticmethod
+    def _fulfill_secure_portal_post(route: Route) -> None:
+        response = route.fetch(max_redirects=0)
+        headers = dict(response.headers)
+        location_header = next(
+            (name for name in headers if name.casefold() == "location"),
+            None,
+        )
+        if (
+            response.status in {301, 302, 303, 307, 308}
+            and location_header is not None
+        ):
+            location = headers[location_header]
+            redirect_url = urlsplit(urljoin(route.request.url, location))
+            try:
+                redirect_port = redirect_url.port
+            except ValueError:
+                redirect_port = -1
+            if (
+                redirect_url.scheme == "http"
+                and redirect_url.hostname == LEGACY_PORTAL_HOST
+            ):
+                if (
+                    redirect_port not in (None, 80)
+                    or redirect_url.username
+                    or redirect_url.password
+                ):
+                    LOGGER.warning(
+                        "Blocked insecure portal redirect after secure POST: %s",
+                        SamadAutomation._safe_url_for_log(
+                            urljoin(route.request.url, location)
+                        ),
+                    )
+                    route.abort()
+                    return
+
+                secure_url = urlunsplit(
+                    (
+                        "https",
+                        LEGACY_PORTAL_HOST,
+                        redirect_url.path,
+                        redirect_url.query,
+                        redirect_url.fragment,
+                    )
+                )
+                headers[location_header] = secure_url
+                LOGGER.debug(
+                    "Upgrading portal POST redirect from %s to %s",
+                    SamadAutomation._safe_url_for_log(
+                        urljoin(route.request.url, location)
+                    ),
+                    SamadAutomation._safe_url_for_log(secure_url),
+                )
+                route.fulfill(response=response, headers=headers)
+                return
+
+        route.fulfill(response=response)
+
+    @staticmethod
     def _protect_portal_request(route: Route) -> None:
         request_url = urlsplit(route.request.url)
         method = route.request.method.upper()
@@ -407,12 +444,17 @@ class SamadAutomation:
                     route.request
                 )
             )
-            if is_unsupported_portal_post or is_redirected_portal_post:
+            if is_unsupported_portal_post or (
+                is_redirected_portal_post and not is_secure_portal_post
+            ):
                 LOGGER.warning(
                     "Blocked insecure or off-origin POST after portal login: %s",
                     SamadAutomation._safe_url_for_log(route.request.url),
                 )
                 route.abort()
+                return
+            if is_secure_portal_post:
+                SamadAutomation._fulfill_secure_portal_post(route)
                 return
 
         route.continue_()
