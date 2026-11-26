@@ -1,6 +1,8 @@
 from contextlib import contextmanager
 import json
 import logging
+import os
+from threading import Lock
 from typing import Iterator
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
@@ -10,6 +12,7 @@ from playwright.sync_api import (
     Frame,
     Locator,
     Page,
+    Playwright,
     Request,
     Response,
     Route,
@@ -33,6 +36,7 @@ from samad_reserver.reservation import (
 _RESERVED_MARKERS = ("لغو رزرو", "رزرو شده", "رزرو ثبت شده")
 _CONFIRM_LABELS = ("تأیید", "تایید", "بله", "رزرو")
 LOGGER = logging.getLogger(__name__)
+_PLAYWRIGHT_DRIVER_START_LOCK = Lock()
 _SECURE_FORM_SUBMISSION_GUARD = """
 const secureFormAction = (form, submitter) => {
     const actionAttribute = submitter && submitter.hasAttribute("formaction")
@@ -87,6 +91,29 @@ document.addEventListener("submit", (event) => {
     }
 }, true);
 """
+
+
+@contextmanager
+def _playwright_with_system_ca() -> Iterator[Playwright]:
+    with _PLAYWRIGHT_DRIVER_START_LOCK:
+        original_node_options = os.environ.get("NODE_OPTIONS")
+        node_options = original_node_options or ""
+        if "--use-system-ca" not in node_options.split():
+            os.environ["NODE_OPTIONS"] = f"{node_options} --use-system-ca".strip()
+
+        manager = sync_playwright()
+        try:
+            playwright = manager.start()
+        finally:
+            if original_node_options is None:
+                os.environ.pop("NODE_OPTIONS", None)
+            else:
+                os.environ["NODE_OPTIONS"] = original_node_options
+
+    try:
+        yield playwright
+    finally:
+        playwright.stop()
 
 
 class SamadAutomation:
@@ -204,7 +231,7 @@ class SamadAutomation:
     @contextmanager
     def _open_page(self) -> Iterator[Page]:
         LOGGER.debug("Launching Chromium (headless=%s)", self.headless)
-        with sync_playwright() as playwright:
+        with _playwright_with_system_ca() as playwright:
             try:
                 browser = playwright.chromium.launch(headless=self.headless)
             except PlaywrightError as error:
@@ -361,7 +388,14 @@ class SamadAutomation:
 
     @staticmethod
     def _fulfill_secure_portal_post(route: Route) -> None:
-        response = route.fetch(max_redirects=0)
+        try:
+            response = route.fetch(max_redirects=0)
+        except PlaywrightError:
+            route.abort()
+            raise ReservationError(
+                "Could not securely inspect the Samad portal response; "
+                "form submission was aborted"
+            ) from None
         headers = dict(response.headers)
         location_header = next(
             (name for name in headers if name.casefold() == "location"),
