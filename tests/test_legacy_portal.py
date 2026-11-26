@@ -127,7 +127,6 @@ class LegacyPortalLoginTests(unittest.TestCase):
         )
         self.automation._visible_count = Mock(return_value=1)
         self.automation._click_unique = Mock()
-        self.automation._handle_send_anyway_prompt = Mock()
         self.automation._wait_for_legacy_dashboard = Mock()
 
         self.automation._login(
@@ -136,51 +135,7 @@ class LegacyPortalLoginTests(unittest.TestCase):
         )
 
         page.evaluate.assert_not_called()
-        self.automation._handle_send_anyway_prompt.assert_called_once_with(page)
         self.automation._wait_for_legacy_dashboard.assert_called_once_with(page)
-
-    def test_clicks_send_anyway_confirmation_on_secure_portal(self) -> None:
-        page = Mock(url="https://food.sru.ac.ir/index.rose")
-        button = Mock()
-        page.get_by_role.return_value = button
-        self.automation._visible_count = Mock(return_value=1)
-        self.automation._click_unique = Mock()
-
-        self.automation._handle_send_anyway_prompt(page)
-
-        page.get_by_role.assert_called_once_with(
-            "button",
-            name="Send anyway",
-            exact=True,
-        )
-        button.wait_for.assert_called_once_with(
-            state="visible",
-            timeout=self.automation.legacy_prompt_timeout_ms,
-        )
-        self.automation._click_unique.assert_called_once_with(
-            button,
-            "Send anyway confirmation button",
-        )
-
-    def test_does_not_click_send_anyway_confirmation_on_nonsecure_origin(self) -> None:
-        page = Mock(url="http://food.sru.ac.ir/index.rose")
-        self.automation._click_unique = Mock()
-
-        self.automation._handle_send_anyway_prompt(page)
-
-        page.get_by_role.assert_not_called()
-        self.automation._click_unique.assert_not_called()
-
-    def test_continues_when_send_anyway_confirmation_is_absent(self) -> None:
-        page = Mock(url="https://food.sru.ac.ir/index.rose")
-        button = Mock()
-        button.wait_for.side_effect = PlaywrightTimeoutError("not present")
-        page.get_by_role.return_value = button
-        self.automation._click_unique = Mock()
-
-        self.automation._handle_send_anyway_prompt(page)
-
-        self.automation._click_unique.assert_not_called()
 
     def test_waits_for_the_dashboard_after_cross_document_login_navigation(self) -> None:
         with self.automation._open_page() as page:
@@ -246,17 +201,80 @@ class LegacyPortalLoginTests(unittest.TestCase):
         route.abort.assert_not_called()
         route.continue_.assert_not_called()
 
-    def test_allows_secure_portal_post_without_node_fetch(self) -> None:
+    def test_fulfills_secure_portal_post_without_redirect(self) -> None:
         route = Mock()
         route.request.url = "https://food.sru.ac.ir/j_security_check"
         route.request.method = "POST"
         route.request.redirected_from = None
+        response = Mock(status=200, headers={})
+        route.fetch.return_value = response
 
         self.automation._protect_portal_request(route)
 
-        route.continue_.assert_called_once_with()
-        route.fetch.assert_not_called()
+        route.fetch.assert_called_once_with(max_redirects=0)
+        route.fulfill.assert_called_once_with(response=response)
+        route.abort.assert_not_called()
+
+    def test_rewrites_http_redirect_from_secure_portal_post_to_https(self) -> None:
+        route = Mock()
+        route.request.url = "https://food.sru.ac.ir/j_security_check"
+        route.request.method = "POST"
+        route.request.redirected_from = None
+        response = Mock(
+            status=307,
+            headers={
+                "content-type": "text/html",
+                "location": "http://food.sru.ac.ir/home.rose?actionName=home",
+                "set-cookie": "session=private",
+            },
+        )
+        route.fetch.return_value = response
+
+        self.automation._protect_portal_request(route)
+
+        route.fetch.assert_called_once_with(max_redirects=0)
+        route.fulfill.assert_called_once_with(
+            response=response,
+            headers={
+                "content-type": "text/html",
+                "location": "https://food.sru.ac.ir/home.rose?actionName=home",
+                "set-cookie": "session=private",
+            },
+        )
+        route.abort.assert_not_called()
+
+    def test_blocks_http_redirect_to_unsupported_portal_port(self) -> None:
+        route = Mock()
+        route.request.url = "https://food.sru.ac.ir/j_security_check"
+        route.request.method = "POST"
+        route.request.redirected_from = None
+        response = Mock(
+            status=307,
+            headers={"location": "http://food.sru.ac.ir:8080/home.rose"},
+        )
+        route.fetch.return_value = response
+
+        with self.assertLogs("samad_reserver.samad_automation", level="WARNING"):
+            self.automation._protect_portal_request(route)
+
+        route.fetch.assert_called_once_with(max_redirects=0)
+        route.abort.assert_called_once_with()
         route.fulfill.assert_not_called()
+
+    def test_allows_same_origin_secure_portal_post_redirects(self) -> None:
+        route = Mock()
+        route.request.url = "https://food.sru.ac.ir/home.rose?actionName=home"
+        route.request.method = "POST"
+        route.request.redirected_from.url = "https://food.sru.ac.ir/j_security_check"
+        route.request.redirected_from.method = "POST"
+        route.request.redirected_from.redirected_from = None
+        response = Mock(status=200, headers={})
+        route.fetch.return_value = response
+
+        self.automation._protect_portal_request(route)
+
+        route.fetch.assert_called_once_with(max_redirects=0)
+        route.fulfill.assert_called_once_with(response=response)
         route.abort.assert_not_called()
 
     def test_upgrades_http_redirected_portal_posts(self) -> None:
