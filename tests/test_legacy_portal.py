@@ -1,5 +1,6 @@
+import os
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Route
@@ -7,7 +8,10 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from samad_reserver.domain import Meal, MealPreference
 from samad_reserver.errors import ReservationError
-from samad_reserver.samad_automation import SamadAutomation
+from samad_reserver.samad_automation import (
+    SamadAutomation,
+    _playwright_with_system_ca,
+)
 
 
 class FakeLocator:
@@ -111,6 +115,27 @@ class LegacyPortalLoginTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ReservationError, "open the legacy portal page"):
             self.automation._login(self.page, Mock())
+
+    def test_playwright_driver_uses_system_ca_and_restores_node_options(self) -> None:
+        playwright = Mock()
+        manager = Mock()
+
+        def start_driver() -> Mock:
+            options = os.environ.get("NODE_OPTIONS", "").split()
+            self.assertIn("--use-system-ca", options)
+            return playwright
+
+        manager.start.side_effect = start_driver
+        with patch.dict(os.environ, {"NODE_OPTIONS": "--trace-warnings"}):
+            with patch(
+                "samad_reserver.samad_automation.sync_playwright",
+                return_value=manager,
+            ):
+                with _playwright_with_system_ca() as actual_playwright:
+                    self.assertIs(actual_playwright, playwright)
+
+            self.assertEqual(os.environ["NODE_OPTIONS"], "--trace-warnings")
+        playwright.stop.assert_called_once_with()
 
     def test_does_not_evaluate_the_old_page_after_login_navigation(self) -> None:
         page = Mock()
@@ -260,6 +285,24 @@ class LegacyPortalLoginTests(unittest.TestCase):
         route.fetch.assert_called_once_with(max_redirects=0)
         route.abort.assert_called_once_with()
         route.fulfill.assert_not_called()
+
+    def test_redacts_route_fetch_failure_after_aborting_secure_post(self) -> None:
+        route = Mock()
+        route.request.url = "https://food.sru.ac.ir/j_security_check"
+        route.request.method = "POST"
+        route.request.redirected_from = None
+        route.fetch.side_effect = PlaywrightError(
+            "TLS certificate verification failed\n"
+            "Call log:\n"
+            "  cookie: JSESSIONID=private-session"
+        )
+
+        with self.assertRaisesRegex(ReservationError, "securely inspect") as error:
+            self.automation._protect_portal_request(route)
+
+        route.abort.assert_called_once_with()
+        self.assertNotIn("private-session", str(error.exception))
+        self.assertIsNone(error.exception.__cause__)
 
     def test_allows_same_origin_secure_portal_post_redirects(self) -> None:
         route = Mock()
